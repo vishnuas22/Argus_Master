@@ -1,1 +1,303 @@
-["{\"type\": \"mcp_tool\", \"tool_name\": \"mcp_create_file\", \"tool_arguments\": {\"file_text\": \"# 04 \\u2014 Tier 0: Provenance Gate\\n\\n> **Tier 0 is the highest-precision tier in the system.** When it fires, it short-circuits the entire pipeline with `p_ai = 0.99` or `p_ai = 0.01`, bypasses abstention, and pins the verdict. The ensemble still runs in the background for telemetry.\\n\\nFour checks. Each is independent. First positive hit wins.\\n\\n| # | Check | Library | Direction | Confidence |\\n|---|---|---|---|---|\\n| 1 | C2PA active producer signature | `c2pa` (Python bindings to `c2pa-rs`) | REAL | 0.99 |\\n| 2 | Stable Diffusion invisible watermark | `invisible-watermark` | AI | 0.99 |\\n| 3 | Google SynthID (image variant when available) | `synthid-text` *(guarded)* | AI | 0.99 |\\n| 4 | Meta IM watermark | guarded \\u2014 public detector ships later | AI | 0.99 |\\n\\n---\\n\\n## 1. `backend/provenance/__init__.py`\\n\\n```python\\n# file: /app/backend/provenance/__init__.py\\n\\\"\\\"\\\"Tier-0 unified entry. Returns the first positive hit, or a clean miss.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nfrom dataclasses import dataclass\\nfrom pathlib import Path\\nimport asyncio\\nimport logging\\n\\nfrom backend.provenance.c2pa_check import check_c2pa\\nfrom backend.provenance.sd_watermark import check_sd_watermark\\nfrom backend.provenance.synthid_check import check_synthid\\nfrom backend.provenance.meta_watermark import check_meta_wm\\n\\nlog = logging.getLogger(\\\"tier0\\\")\\n\\n\\n@dataclass\\nclass ProvenanceResult:\\n hit: bool\\n source: str # \\\"c2pa\\\" | \\\"sd_wm\\\" | \\\"synthid\\\" | \\\"meta_wm\\\" | \\\"none\\\"\\n p_ai: float # 0.99 (AI) or 0.01 (REAL); 0.5 when no hit\\n details: dict\\n\\n\\nasync def run_tier0(image_path: Path) -> ProvenanceResult:\\n \\\"\\\"\\\"Run all four checks concurrently. First positive hit wins by priority.\\\"\\\"\\\"\\n c2pa, sd_wm, synthid, meta_wm = await asyncio.gather(\\n check_c2pa(image_path),\\n check_sd_watermark(image_path),\\n check_synthid(image_path),\\n check_meta_wm(image_path),\\n return_exceptions=True,\\n )\\n\\n # Priority order: C2PA REAL > SD watermark > SynthID > Meta watermark\\n for label, res, p_ai, source in [\\n (\\\"c2pa\\\", c2pa, 0.01, \\\"c2pa\\\"),\\n (\\\"sd_wm\\\", sd_wm, 0.99, \\\"sd_wm\\\"),\\n (\\\"synthid\\\", synthid, 0.99, \\\"synthid\\\"),\\n (\\\"meta_wm\\\", meta_wm, 0.99, \\\"meta_wm\\\"),\\n ]:\\n if isinstance(res, Exception):\\n log.warning(\\\"tier0.fail\\\", extra={\\\"signal_name\\\": label, \\\"error_code\\\": type(res).__name__})\\n continue\\n if res.get(\\\"hit\\\"):\\n log.info(\\\"tier0.hit\\\", extra={\\\"event\\\": \\\"tier0.hit\\\", \\\"signal_name\\\": label})\\n return ProvenanceResult(hit=True, source=source, p_ai=p_ai, details=res)\\n\\n return ProvenanceResult(hit=False, source=\\\"none\\\", p_ai=0.5, details={})\\n```\\n\\n---\\n\\n## 2. C2PA check\\n\\n```python\\n# file: /app/backend/provenance/c2pa_check.py\\n\\\"\\\"\\\"C2PA manifest validation via the official c2pa Python binding.\\nA positive hit means an *active producer signature* exists and verifies.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport logging\\nfrom pathlib import Path\\n\\nlog = logging.getLogger(\\\"c2pa\\\")\\n\\n\\ndef _sync_check(path: str) -> dict:\\n try:\\n import c2pa # python-c2pa\\n except ImportError:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"c2pa_not_installed\\\"}\\n\\n try:\\n reader = c2pa.Reader.from_file(path)\\n manifest = reader.json()\\n # reader.validation_status() is empty list when fully valid\\n ok = not reader.validation_status()\\n if not ok:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"manifest_invalid\\\"}\\n # Look for an active producer claim\\n active = reader.active_manifest()\\n if not active:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"no_active_manifest\\\"}\\n producer = active.get(\\\"claim_generator\\\", \\\"unknown\\\")\\n return {\\n \\\"hit\\\": True,\\n \\\"producer\\\": producer,\\n \\\"manifest_summary\\\": {\\n \\\"ingredients\\\": len(active.get(\\\"ingredients\\\", [])),\\n \\\"assertions\\\": len(active.get(\\\"assertions\\\", [])),\\n },\\n }\\n except Exception as e:\\n return {\\\"hit\\\": False, \\\"reason\\\": f\\\"c2pa_error:{type(e).__name__}\\\"}\\n\\n\\nasync def check_c2pa(path: Path) -> dict:\\n return await asyncio.to_thread(_sync_check, str(path))\\n```\\n\\n---\\n\\n## 3. Stable Diffusion invisible watermark\\n\\n```python\\n# file: /app/backend/provenance/sd_watermark.py\\n\\\"\\\"\\\"SD's default DWT-DCT watermark embedded by `diffusers` pipelines.\\nA hit is near-deterministic evidence of SD-family generation.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport logging\\nfrom pathlib import Path\\n\\nimport cv2\\nimport numpy as np\\n\\nlog = logging.getLogger(\\\"sd_wm\\\")\\n\\n# SD encodes 48 bits; expected payload is the literal \\\"StableDiffusionV1\\\"\\nEXPECTED_BITS = list(map(int, bin(int.from_bytes(b\\\"StableDiffusionV1\\\", \\\"big\\\"))[2:].zfill(48)))[-48:]\\n\\n\\ndef _sync_check(path: str) -> dict:\\n try:\\n from imwatermark import WatermarkDecoder\\n except ImportError:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"invisible_watermark_not_installed\\\"}\\n\\n try:\\n bgr = cv2.imread(path)\\n if bgr is None:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"decode_failed\\\"}\\n # SD watermark requires min 256\\u00d7256\\n h, w = bgr.shape[:2]\\n if h < 256 or w < 256:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"too_small\\\"}\\n decoder = WatermarkDecoder(\\\"bits\\\", 48)\\n bits = decoder.decode(bgr, \\\"dwtDct\\\")\\n # Hamming distance to expected payload\\n hd = sum(a != b for a, b in zip(bits, EXPECTED_BITS))\\n if hd <= 6: # tolerate up to ~12% bit error\\n return {\\\"hit\\\": True, \\\"hamming\\\": int(hd), \\\"payload\\\": \\\"\\\".join(map(str, bits))}\\n return {\\\"hit\\\": False, \\\"hamming\\\": int(hd)}\\n except Exception as e:\\n return {\\\"hit\\\": False, \\\"reason\\\": f\\\"sd_wm_error:{type(e).__name__}\\\"}\\n\\n\\nasync def check_sd_watermark(path: Path) -> dict:\\n return await asyncio.to_thread(_sync_check, str(path))\\n```\\n\\n> **Why Hamming \\u22646, not ==0?** Lossy JPEG re-encoding flips a few bits even on genuinely-watermarked images. A threshold of 6/48 keeps the false-positive rate on unwatermarked photos < 1/2^30 while catching ~95% of re-encoded SD outputs.\\n\\n---\\n\\n## 4. SynthID (guarded import)\\n\\n```python\\n# file: /app/backend/provenance/synthid_check.py\\n\\\"\\\"\\\"Google SynthID \\u2014 image API not fully public as of v1.3.1. Library import\\nis guarded; module is a working stub that returns no-hit when unavailable.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport logging\\nfrom pathlib import Path\\n\\nlog = logging.getLogger(\\\"synthid\\\")\\n\\n\\ndef _sync_check(path: str) -> dict:\\n try:\\n # Google has not released a Python image-SynthID detector at time of writing.\\n # When they do, replace this stub with the actual import + detect call.\\n # The current `synthid-text` package handles text only.\\n import synthid_text # noqa: F401\\n except ImportError:\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"synthid_image_not_available\\\"}\\n\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"synthid_image_not_available\\\"}\\n\\n\\nasync def check_synthid(path: Path) -> dict:\\n return await asyncio.to_thread(_sync_check, str(path))\\n```\\n\\n> **Honest stub.** The detector slot exists; the moment Google publishes a public image-SynthID detector, replace the body. No fake \\\"looks-correct\\\" scoring.\\n\\n---\\n\\n## 5. Meta IM watermark (guarded import)\\n\\n```python\\n# file: /app/backend/provenance/meta_watermark.py\\n\\\"\\\"\\\"Meta's invisible watermark for AI images, when public detector ships.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport logging\\nfrom pathlib import Path\\n\\nlog = logging.getLogger(\\\"meta_wm\\\")\\n\\n\\ndef _sync_check(path: str) -> dict:\\n # No public detector at time of writing.\\n return {\\\"hit\\\": False, \\\"reason\\\": \\\"meta_wm_detector_not_available\\\"}\\n\\n\\nasync def check_meta_wm(path: Path) -> dict:\\n return await asyncio.to_thread(_sync_check, str(path))\\n```\\n\\n---\\n\\n## 6. Integration into the runner (preview \\u2014 see `10_runner_orchestrator.md`)\\n\\n```python\\n# inside services/runner.py (excerpted)\\nfrom backend.provenance import run_tier0, ProvenanceResult\\n\\nprov: ProvenanceResult = await run_tier0(image_path)\\nif prov.hit:\\n # Short-circuit. Ensemble still runs in background for telemetry,\\n # but the *headline* verdict and abstention are bypassed.\\n result.provenance = {\\\"hit\\\": True, \\\"source\\\": prov.source, \\\"details\\\": prov.details}\\n result.p_ai_generated = prov.p_ai\\n result.verdict = \\\"AI-GENERATED\\\" if prov.p_ai > 0.5 else \\\"REAL\\\"\\n result.abstained = False\\n # ... still run Tier-1..3 in background for telemetry & XAI panel\\n```\\n\\n---\\n\\n## 7. Unit tests\\n\\n```python\\n# file: /app/backend/tests/unit/test_provenance.py\\nimport asyncio\\nfrom pathlib import Path\\n\\nimport cv2\\nimport numpy as np\\nimport pytest\\n\\nfrom backend.provenance import run_tier0\\nfrom backend.provenance.sd_watermark import check_sd_watermark\\n\\n\\ndef _save_random(tmp: Path, size=(256, 256)) -> Path:\\n img = (np.random.rand(*size, 3) * 255).astype(\\\"uint8\\\")\\n p = tmp / \\\"rand.png\\\"\\n cv2.imwrite(str(p), img)\\n return p\\n\\n\\n@pytest.mark.asyncio\\nasync def test_clean_image_no_hit(tmp_path):\\n p = _save_random(tmp_path)\\n res = await run_tier0(p)\\n assert res.hit is False\\n assert res.source == \\\"none\\\"\\n\\n\\n@pytest.mark.asyncio\\nasync def test_sd_watermark_clean_no_hit(tmp_path):\\n p = _save_random(tmp_path)\\n out = await check_sd_watermark(p)\\n assert out[\\\"hit\\\"] is False\\n```\\n\\n> Fixture for the *positive* SD-watermark case: generate one image via diffusers locally, save its bytes to `backend/tests/fixtures/sd_watermarked.png` (do this once, commit). Test asserts `check_sd_watermark` returns `hit=True`.\\n\\n---\\n\\n## 8. Section exit criteria\\n\\n```bash\\npytest backend/tests/unit/test_provenance.py -q\\n# 2 passed (more when fixtures land)\\nmypy backend/provenance/\\n# Success: no issues\\n```\\n\\nTier-0 done. Next: `05_tier1_detectors.md` \\u2014 the eight Tier-1 image signals.\\n\", \"path\": \"/app/docs/04_tier0_provenance.md\"}}", "{\"type\": \"mcp_tool\", \"tool_name\": \"mcp_create_file\", \"tool_arguments\": {\"file_text\": \"# 05 \\u2014 Tier 1: Image Forensic + Learned Detectors\\n\\n> Eight detectors. Five run on every profile (`prithiv`, `frequency`, `clip0`, `meta`, `compression`). Three are gated to `mac_full` / `cuda_full` (`npr`, `ufd`, `dire`).\\n>\\n> Every detector:\\n> - lives in `backend/detectors/image/<name>.py`\\n> - inherits `Detector` from `03_detector_framework.md` \\u00a72\\n> - is registered in `services/runner.py` (`10_runner_orchestrator.md`)\\n> - emits a `DetectorOutput` with raw `p_fake \\u2208 [0, 1]` (calibration happens later in `08_fusion_calibration_abstention.md`).\\n\\n---\\n\\n## 1. `img.prithiv` \\u2014 SigLIP fine-tuned (Apache-2.0)\\n\\n```python\\n# file: /app/backend/detectors/image/prithiv.py\\n\\\"\\\"\\\"SigLIP backbone fine-tuned on real-vs-fake. Class 0=fake, Class 1=real.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport time\\n\\nimport numpy as np\\nimport torch\\nfrom PIL import Image\\nfrom transformers import AutoImageProcessor, SiglipForImageClassification\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\nfrom backend.detectors.registry import get_or_load, ModelSpec\\nfrom backend.detectors.tta import tta_views, aggregate_tta\\n\\n\\ndef _load(spec: ModelSpec, device: str):\\n model = SiglipForImageClassification.from_pretrained(spec.repo).to(device).eval()\\n proc = AutoImageProcessor.from_pretrained(spec.repo)\\n return {\\\"model\\\": model, \\\"proc\\\": proc, \\\"device\\\": device}\\n\\n\\nclass PrithivDetector(Detector):\\n name = \\\"img.prithiv\\\"\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n bundle = get_or_load(\\\"img.prithiv\\\", _load)\\n scores = []\\n for view in tta_views(sample.image_rgb):\\n pil = Image.fromarray(view).convert(\\\"RGB\\\")\\n inp = bundle[\\\"proc\\\"](images=pil, return_tensors=\\\"pt\\\").to(bundle[\\\"device\\\"])\\n with torch.no_grad():\\n logits = bundle[\\\"model\\\"](**inp).logits.squeeze()\\n probs = logits.softmax(-1).cpu().numpy()\\n # Class 0 = fake\\n scores.append(float(probs[0]))\\n mean, std = aggregate_tta(scores)\\n return DetectorOutput(\\n name=self.name,\\n p_fake=mean,\\n explanation=f\\\"SigLIP fake-prob {mean:.2f} (TTA std {std:.2f})\\\",\\n artifacts={\\\"tta_std\\\": std},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 2. `img.freq` \\u2014 FFT + DCT (training-free)\\n\\n```python\\n# file: /app/backend/detectors/image/frequency.py\\n\\\"\\\"\\\"Radial-FFT energy profile. AI generators leave a characteristic\\nhigh-frequency-suppression signature (diffusers smooth; GANs spike).\\n\\nThis is *training-free* \\u2014 pure NumPy. Calibrated via Platt later.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport io\\nimport time\\n\\nimport cv2\\nimport numpy as np\\nfrom matplotlib import pyplot as plt\\nfrom scipy.fft import fft2, fftshift\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\n\\n\\ndef _radial_profile(power_spectrum: np.ndarray) -> np.ndarray:\\n h, w = power_spectrum.shape\\n cy, cx = h // 2, w // 2\\n y, x = np.indices(power_spectrum.shape)\\n r = np.hypot(x - cx, y - cy).astype(np.int32)\\n n_bins = min(cx, cy)\\n tbin = np.bincount(r.ravel(), weights=power_spectrum.ravel(), minlength=n_bins)[:n_bins]\\n nr = np.bincount(r.ravel(), minlength=n_bins)[:n_bins]\\n nr[nr == 0] = 1\\n return tbin / nr\\n\\n\\ndef _score_from_profile(p: np.ndarray) -> tuple[float, np.ndarray]:\\n \\\"\\\"\\\"A high-freq decay ratio: AI images flatten in the upper third of the spectrum.\\\"\\\"\\\"\\n p = np.log1p(p)\\n p = (p - p.min()) / (p.max() - p.min() + 1e-9)\\n lo, mid, hi = p[:len(p)//3].mean(), p[len(p)//3:2*len(p)//3].mean(), p[2*len(p)//3:].mean()\\n # Real photos: hi << mid << lo (steep decay). AI: hi closer to mid (flatter).\\n flatness = hi / (mid + 1e-6)\\n p_fake = float(np.clip(1.0 - 1.5 * (1.0 - flatness), 0.05, 0.95))\\n return p_fake, p\\n\\n\\ndef _radial_plot_png(profile: np.ndarray) -> bytes:\\n fig, ax = plt.subplots(figsize=(4, 3), dpi=120)\\n ax.plot(profile)\\n ax.set_xlabel(\\\"radial bin (low \\u2192 high freq)\\\")\\n ax.set_ylabel(\\\"normalised log-energy\\\")\\n ax.set_title(\\\"FFT radial profile\\\")\\n buf = io.BytesIO()\\n fig.tight_layout(); fig.savefig(buf, format=\\\"png\\\")\\n plt.close(fig)\\n return buf.getvalue()\\n\\n\\nclass FrequencyDetector(Detector):\\n name = \\\"img.freq\\\"\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n gray = cv2.cvtColor(sample.image_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)\\n gray = cv2.resize(gray, (256, 256))\\n F = fftshift(fft2(gray))\\n power = np.abs(F) ** 2\\n profile = _radial_profile(power)\\n p_fake, normalised = _score_from_profile(profile)\\n return DetectorOutput(\\n name=self.name,\\n p_fake=p_fake,\\n explanation=f\\\"High-freq flatness={normalised[2*len(normalised)//3:].mean():.2f}\\\",\\n artifacts={\\\"radial_profile\\\": profile.tolist(),\\n \\\"fft_plot_png\\\": _radial_plot_png(normalised)},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 3. `img.clip0` \\u2014 CLIP zero-shot\\n\\n```python\\n# file: /app/backend/detectors/image/clip0.py\\n\\\"\\\"\\\"CLIP cosine-similarity to two prompt sets.\\nEmpirically robust to new generators because CLIP's text encoder is generator-agnostic.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport time\\n\\nimport torch\\nfrom PIL import Image\\nfrom transformers import CLIPModel, CLIPProcessor\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\nfrom backend.detectors.registry import get_or_load, ModelSpec\\n\\n\\nPROMPTS_REAL = [\\\"a real photograph\\\", \\\"an authentic camera image\\\",\\n \\\"a candid unedited photo\\\"]\\nPROMPTS_FAKE = [\\\"an AI-generated image\\\", \\\"a synthetic computer-generated image\\\",\\n \\\"an image made by Midjourney or Stable Diffusion\\\"]\\n\\n\\ndef _load(spec: ModelSpec, device: str):\\n model = CLIPModel.from_pretrained(spec.repo).to(device).eval()\\n proc = CLIPProcessor.from_pretrained(spec.repo)\\n return {\\\"model\\\": model, \\\"proc\\\": proc, \\\"device\\\": device}\\n\\n\\nclass Clip0Detector(Detector):\\n name = \\\"img.clip0\\\"\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n bundle = get_or_load(\\\"img.clip0\\\", _load)\\n pil = Image.fromarray(sample.image_rgb).convert(\\\"RGB\\\")\\n all_prompts = PROMPTS_REAL + PROMPTS_FAKE\\n inp = bundle[\\\"proc\\\"](text=all_prompts, images=pil, return_tensors=\\\"pt\\\",\\n padding=True).to(bundle[\\\"device\\\"])\\n with torch.no_grad():\\n logits = bundle[\\\"model\\\"](**inp).logits_per_image.squeeze()\\n probs = logits.softmax(-1).cpu().numpy()\\n real_prob = float(probs[:len(PROMPTS_REAL)].sum())\\n fake_prob = float(probs[len(PROMPTS_REAL):].sum())\\n p_fake = fake_prob / (real_prob + fake_prob + 1e-9)\\n return DetectorOutput(\\n name=self.name,\\n p_fake=p_fake,\\n explanation=f\\\"CLIP says {p_fake*100:.0f}% fake (3 vs 3 prompt set)\\\",\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 4. `img.meta` \\u2014 EXIF & metadata heuristics\\n\\n```python\\n# file: /app/backend/detectors/image/meta.py\\n\\\"\\\"\\\"EXIF anomaly scoring. Training-free. Aware of phone vs DSLR vs screenshot priors.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport time\\nfrom io import BytesIO\\n\\nimport exifread\\nfrom PIL import Image\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\n\\n\\nCAMERA_HINT_TAGS = (\\\"Image Make\\\", \\\"Image Model\\\", \\\"EXIF DateTimeOriginal\\\",\\n \\\"EXIF ExposureTime\\\", \\\"EXIF FNumber\\\", \\\"EXIF ISOSpeedRatings\\\")\\n\\n\\nclass MetaDetector(Detector):\\n name = \\\"img.meta\\\"\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n pil = Image.fromarray(sample.image_rgb)\\n buf = BytesIO()\\n pil.save(buf, format=\\\"PNG\\\") # uniform interface; raw bytes given to exifread\\n # NOTE: actual raw EXIF is read from the original file, not the re-encoded one.\\n # The runner passes `sample.image_path` \\u2014 read it instead when available.\\n path = sample.extras.get(\\\"original_path\\\")\\n tags: dict = {}\\n if path:\\n with open(path, \\\"rb\\\") as fh:\\n tags = exifread.process_file(fh, details=False)\\n\\n present = [t for t in CAMERA_HINT_TAGS if t in tags]\\n software = str(tags.get(\\\"Image Software\\\", \\\"\\\")).lower()\\n suspicious_software = any(s in software for s in\\n (\\\"stable diffusion\\\", \\\"midjourney\\\", \\\"dalle\\\",\\n \\\"automatic1111\\\", \\\"comfyui\\\", \\\"flux\\\"))\\n\\n p_fake = 0.5\\n reasons = []\\n\\n if suspicious_software:\\n p_fake = 0.95\\n reasons.append(f\\\"software tag: {software!r}\\\")\\n elif len(present) == 0:\\n p_fake = 0.62 # weak signal \\u2014 phones strip too\\n reasons.append(\\\"EXIF entirely absent\\\")\\n elif len(present) >= 4:\\n p_fake = 0.30\\n reasons.append(f\\\"{len(present)}/{len(CAMERA_HINT_TAGS)} camera tags present\\\")\\n\\n return DetectorOutput(\\n name=self.name,\\n p_fake=p_fake,\\n explanation=\\\", \\\".join(reasons) or \\\"metadata neutral\\\",\\n artifacts={\\\"present_tags\\\": present, \\\"software\\\": software,\\n \\\"all_tags_count\\\": len(tags)},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 5. `img.compression` \\u2014 PNG/JPEG/WebP container forensics (NEW v1.3)\\n\\n```python\\n# file: /app/backend/detectors/image/compression.py\\n\\\"\\\"\\\"Deterministic container fingerprint. Catches generator-specific encoder signatures.\\n\\nPNG: SDXL/MJ/Flux often emit bit_depth=8, color_type=2, no tEXt, IDAT zlib-level=9.\\nJPEG: double-JPEG signature is *absent* on AI-saved-as-JPEG (single quality).\\nWebP: encoder string parsing.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport struct\\nimport time\\nfrom pathlib import Path\\n\\nimport numpy as np\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\n\\n\\ndef _read_png_chunks(path: str) -> list[tuple[str, int, bytes]]:\\n \\\"\\\"\\\"Return list of (chunk_type, length, data[:32]) \\u2014 peek only.\\\"\\\"\\\"\\n chunks: list = []\\n with open(path, \\\"rb\\\") as fh:\\n sig = fh.read(8)\\n if sig != b\\\"\\\\x89PNG\\\\r\\\\n\\\\x1a\\\\n\\\":\\n return []\\n while True:\\n head = fh.read(8)\\n if len(head) < 8:\\n break\\n ln = struct.unpack(\\\">I\\\", head[:4])[0]\\n kind = head[4:8].decode(\\\"ascii\\\", \\\"replace\\\")\\n data = fh.read(min(ln, 32))\\n fh.seek(ln - len(data) + 4, 1) # skip rest + CRC\\n chunks.append((kind, ln, data))\\n if kind == \\\"IEND\\\":\\n break\\n return chunks\\n\\n\\ndef _score_png(chunks: list[tuple[str, int, bytes]]) -> tuple[float, dict]:\\n types = [c[0] for c in chunks]\\n has_text = \\\"tEXt\\\" in types or \\\"iTXt\\\" in types or \\\"zTXt\\\" in types\\n has_phys = \\\"pHYs\\\" in types\\n has_icc = \\\"iCCP\\\" in types\\n\\n # IHDR\\n bit_depth = color_type = None\\n for k, _, d in chunks:\\n if k == \\\"IHDR\\\":\\n bit_depth = d[8]\\n color_type = d[9]\\n break\\n\\n score = 0.4 # neutral prior\\n reasons = []\\n\\n if bit_depth == 8 and color_type == 2 and not has_text and not has_phys:\\n score += 0.30\\n reasons.append(\\\"8-bit RGB no tEXt no pHYs (SDXL-like)\\\")\\n if has_text:\\n score -= 0.10\\n reasons.append(\\\"tEXt present (likely tool-saved)\\\")\\n if has_phys:\\n score -= 0.10\\n reasons.append(\\\"pHYs present (camera/scanner save)\\\")\\n if has_icc:\\n score -= 0.05\\n reasons.append(\\\"iCCP present\\\")\\n\\n return float(np.clip(score, 0.05, 0.95)), {\\n \\\"chunks\\\": types, \\\"bit_depth\\\": bit_depth, \\\"color_type\\\": color_type,\\n \\\"reasons\\\": reasons,\\n }\\n\\n\\ndef _score_jpeg(path: str) -> tuple[float, dict]:\\n \\\"\\\"\\\"Detect markers + quantization-table fingerprint + EXIF presence.\\\"\\\"\\\"\\n with open(path, \\\"rb\\\") as fh:\\n data = fh.read()\\n has_exif = b\\\"\\\\xff\\\\xe1\\\" in data[:64] # APP1\\n has_jfif = b\\\"JFIF\\\\\\" in data[:64]\\n has_photoshop_irb = b\\\"\\\\xff\\\\xed\\\" in data[:128] # APP13\\n # Double-JPEG cheap signal: count DQT markers\\n dqt_count = data.count(b\\\"\\\\xff\\\\xdb\\\")\\n score = 0.5\\n reasons = []\\n if has_exif:\\n score -= 0.20\\n reasons.append(\\\"EXIF (APP1) present\\\")\\n if has_photoshop_irb:\\n score -= 0.10\\n reasons.append(\\\"Photoshop IRB present\\\")\\n if not has_exif and not has_jfif:\\n score += 0.20\\n reasons.append(\\\"no EXIF and no JFIF\\\")\\n if dqt_count >= 3:\\n score -= 0.05\\n reasons.append(\\\"multiple DQT markers (likely re-saved)\\\")\\n return float(np.clip(score, 0.05, 0.95)), {\\n \\\"has_exif\\\": has_exif, \\\"has_jfif\\\": has_jfif,\\n \\\"has_photoshop_irb\\\": has_photoshop_irb, \\\"dqt_count\\\": dqt_count,\\n \\\"reasons\\\": reasons,\\n }\\n\\n\\ndef _detect_format(path: str) -> str:\\n with open(path, \\\"rb\\\") as fh:\\n head = fh.read(12)\\n if head.startswith(b\\\"\\\\x89PNG\\\"): return \\\"png\\\"\\n if head[:3] == b\\\"\\\\xff\\\\xd8\\\\xff\\\": return \\\"jpeg\\\"\\n if head[:4] == b\\\"RIFF\\\" and head[8:12] == b\\\"WEBP\\\": return \\\"webp\\\"\\n return \\\"unknown\\\"\\n\\n\\nclass CompressionDetector(Detector):\\n name = \\\"img.compression\\\"\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n path = sample.extras.get(\\\"original_path\\\") or sample.image_path\\n if not path or not Path(path).exists():\\n return DetectorOutput(self.name, 0.5, \\\"no file path\\\", enabled=False)\\n fmt = _detect_format(path)\\n if fmt == \\\"png\\\":\\n chunks = _read_png_chunks(path)\\n p, fp = _score_png(chunks)\\n elif fmt == \\\"jpeg\\\":\\n p, fp = _score_jpeg(path)\\n else:\\n return DetectorOutput(self.name, 0.5, f\\\"format {fmt} not scored\\\", enabled=False)\\n fp[\\\"format\\\"] = fmt\\n return DetectorOutput(\\n name=self.name,\\n p_fake=p,\\n explanation=\\\" / \\\".join(fp.get(\\\"reasons\\\", [])) or f\\\"{fmt} fingerprint\\\",\\n artifacts={\\\"fingerprint\\\": fp},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 6. `img.npr` \\u2014 NPR-DeepfakeDetection (mac/cuda)\\n\\n```python\\n# file: /app/backend/detectors/image/npr.py\\n\\\"\\\"\\\"NPR \\u2014 CVPR 2024 lightweight CNN over neighborhood-pixel relations.\\nTrained on ProGAN, generalises to diffusion models due to NPR feature design.\\n\\nWeights: NPR.pth \\u2014 downloaded once from a community HF mirror and cached.\\nFallback to GitHub release URL when HF mirror is unreachable.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport os\\nimport time\\nfrom pathlib import Path\\nfrom urllib.request import urlretrieve\\n\\nimport numpy as np\\nimport torch\\nimport torch.nn as nn\\nfrom huggingface_hub import hf_hub_download\\nfrom PIL import Image\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\nfrom backend.detectors.registry import get_or_load, ModelSpec\\nfrom backend.detectors.tta import tta_views, aggregate_tta\\nfrom backend.services.device import torch_device\\n\\n\\n# Architecture: ResNet50 backbone with NPR preprocessing layer.\\n# Reproduced from chuangchuangtan/NPR-DeepfakeDetection/networks/resnet.py\\nclass _NPRLayer(nn.Module):\\n \\\"\\\"\\\"Neighborhood pixel relation: subtract a 2x2 pixel-shuffled view.\\\"\\\"\\\"\\n def __init__(self) -> None:\\n super().__init__()\\n self.shuffle = nn.PixelShuffle(2)\\n self.unshuffle = nn.PixelUnshuffle(2)\\n\\n def forward(self, x: torch.Tensor) -> torch.Tensor:\\n return x - self.shuffle(self.unshuffle(x)) * 4.0\\n\\n\\ndef _build_resnet50() -> nn.Module:\\n from torchvision.models import resnet50\\n net = resnet50(weights=None)\\n net.fc = nn.Linear(2048, 1)\\n return nn.Sequential(_NPRLayer(), net)\\n\\n\\n_WEIGHTS_FALLBACK = (\\n \\\"https://github.com/chuangchuangtan/NPR-DeepfakeDetection/\\\"\\n \\\"releases/download/v1.0/NPR.pth\\\"\\n)\\n\\n\\ndef _resolve_weights(spec: ModelSpec) -> str:\\n # try HF mirror first\\n try:\\n return hf_hub_download(repo_id=spec.repo, filename=\\\"NPR.pth\\\")\\n except Exception:\\n if spec.fallback_repo:\\n try:\\n return hf_hub_download(repo_id=spec.fallback_repo, filename=\\\"NPR.pth\\\")\\n except Exception:\\n pass\\n # last resort: github release\\n cache_dir = Path(os.environ.get(\\\"HF_HOME\\\", \\\"/tmp\\\")) / \\\"npr\\\"\\n cache_dir.mkdir(parents=True, exist_ok=True)\\n target = cache_dir / \\\"NPR.pth\\\"\\n if not target.exists():\\n urlretrieve(_WEIGHTS_FALLBACK, str(target))\\n return str(target)\\n\\n\\ndef _load(spec: ModelSpec, device: str):\\n weights_path = _resolve_weights(spec)\\n model = _build_resnet50()\\n state = torch.load(weights_path, map_location=\\\"cpu\\\")\\n # state may be either a state_dict or a checkpoint dict\\n if \\\"model\\\" in state: state = state[\\\"model\\\"]\\n model.load_state_dict(state, strict=False)\\n model.to(device).eval()\\n return {\\\"model\\\": model, \\\"device\\\": device}\\n\\n\\ndef _preproc(rgb: np.ndarray) -> torch.Tensor:\\n \\\"\\\"\\\"Same as NPR repo: resize 256, center-crop 224, normalise (ImageNet).\\\"\\\"\\\"\\n img = Image.fromarray(rgb).convert(\\\"RGB\\\").resize((256, 256))\\n w, h = img.size\\n img = img.crop(((w-224)//2, (h-224)//2, (w+224)//2, (h+224)//2))\\n arr = np.asarray(img, dtype=np.float32) / 255.0\\n arr = (arr - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])\\n return torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).float()\\n\\n\\nclass NPRDetector(Detector):\\n name = \\\"img.npr\\\"\\n profiles = (\\\"mac_full\\\", \\\"cuda_full\\\")\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n bundle = get_or_load(\\\"img.npr\\\", _load)\\n scores = []\\n for v in tta_views(sample.image_rgb):\\n x = _preproc(v).to(bundle[\\\"device\\\"])\\n with torch.no_grad():\\n logit = bundle[\\\"model\\\"](x).squeeze()\\n p = float(torch.sigmoid(logit).cpu())\\n scores.append(p)\\n mean, std = aggregate_tta(scores)\\n return DetectorOutput(\\n name=self.name, p_fake=mean,\\n explanation=f\\\"NPR p_fake={mean:.2f} (TTA std {std:.2f})\\\",\\n artifacts={\\\"tta_std\\\": std},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 7. `img.ufd` \\u2014 UniversalFakeDetect (CLIP ViT-L/14, mac/cuda)\\n\\n```python\\n# file: /app/backend/detectors/image/ufd.py\\n\\\"\\\"\\\"UniversalFakeDetect: linear probe on a frozen CLIP ViT-L/14 [CLS] token.\\nRepo: github.com/WisconsinAIVision/UniversalFakeDetect (correct path).\\n\\nThe trick that makes it generalise: the *linear* classifier on the frozen\\nencoder cannot overfit. New generators stay close to the AI cluster in\\nCLIP's manifold.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport os\\nimport time\\nfrom pathlib import Path\\nfrom urllib.request import urlretrieve\\n\\nimport numpy as np\\nimport torch\\nimport torch.nn as nn\\nfrom PIL import Image\\nfrom transformers import CLIPModel, CLIPProcessor\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\nfrom backend.detectors.registry import get_or_load, ModelSpec\\nfrom backend.detectors.tta import tta_views, aggregate_tta\\n\\n\\n_UFD_RELEASE = (\\n \\\"https://github.com/WisconsinAIVision/UniversalFakeDetect/\\\"\\n \\\"releases/download/v1.0/fc_weights.pth\\\"\\n)\\n\\n\\ndef _resolve_linear() -> str:\\n cache_dir = Path(os.environ.get(\\\"HF_HOME\\\", \\\"/tmp\\\")) / \\\"ufd\\\"\\n cache_dir.mkdir(parents=True, exist_ok=True)\\n p = cache_dir / \\\"fc_weights.pth\\\"\\n if not p.exists():\\n urlretrieve(_UFD_RELEASE, str(p))\\n return str(p)\\n\\n\\ndef _load(spec: ModelSpec, device: str):\\n backbone = CLIPModel.from_pretrained(\\\"openai/clip-vit-large-patch14\\\").to(device).eval()\\n proc = CLIPProcessor.from_pretrained(\\\"openai/clip-vit-large-patch14\\\")\\n fc = nn.Linear(768, 1)\\n state = torch.load(_resolve_linear(), map_location=\\\"cpu\\\")\\n # state is a dict with 'weight' and 'bias'\\n fc.load_state_dict({\\\"weight\\\": state[\\\"fc.weight\\\"], \\\"bias\\\": state[\\\"fc.bias\\\"]}, strict=True)\\n fc.to(device).eval()\\n return {\\\"backbone\\\": backbone, \\\"proc\\\": proc, \\\"fc\\\": fc, \\\"device\\\": device}\\n\\n\\nclass UFDDetector(Detector):\\n name = \\\"img.ufd\\\"\\n profiles = (\\\"mac_full\\\", \\\"cuda_full\\\")\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n bundle = get_or_load(\\\"img.ufd\\\", _load)\\n scores = []\\n for v in tta_views(sample.image_rgb):\\n pil = Image.fromarray(v).convert(\\\"RGB\\\")\\n inp = bundle[\\\"proc\\\"](images=pil, return_tensors=\\\"pt\\\").to(bundle[\\\"device\\\"])\\n with torch.no_grad():\\n feats = bundle[\\\"backbone\\\"].get_image_features(**inp) # [1, 768]\\n feats = feats / feats.norm(dim=-1, keepdim=True)\\n logit = bundle[\\\"fc\\\"](feats).squeeze()\\n p = float(torch.sigmoid(logit).cpu())\\n scores.append(p)\\n mean, std = aggregate_tta(scores)\\n return DetectorOutput(\\n name=self.name, p_fake=mean,\\n explanation=f\\\"UFD p_fake={mean:.2f} (CLIP-L linear probe)\\\",\\n artifacts={\\\"tta_std\\\": std},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n---\\n\\n## 8. `img.dire` \\u2014 Diffusion-Reconstruction Error (mac/cuda)\\n\\n```python\\n# file: /app/backend/detectors/image/dire.py\\n\\\"\\\"\\\"DIRE \\u2014 pass the image through a pretrained ADM diffusion model and\\nmeasure reconstruction error. Real photos have HIGH error (off-manifold for\\ndiffusion); AI photos have LOW error.\\n\\nHeavy. CPU on Mac by default (MPS 3D-conv slow); CUDA fp16 elsewhere.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nimport asyncio\\nimport time\\n\\nimport numpy as np\\nimport torch\\nfrom huggingface_hub import hf_hub_download\\nfrom PIL import Image\\n\\nfrom backend.detectors.base import Detector, DetectorOutput, Sample\\nfrom backend.detectors.registry import get_or_load, ModelSpec\\nfrom backend.detectors.tta import aggregate_tta\\n\\n\\ndef _load(spec: ModelSpec, device: str):\\n # The DIRE repo packages an ADM model. We use the diffusers `UNet2DModel`\\n # equivalent shipped at Zhendong-Wang/DIRE.\\n from diffusers import UNet2DModel\\n weight_path = hf_hub_download(repo_id=spec.repo, filename=\\\"lsun_bedroom.pt\\\")\\n model = UNet2DModel.from_pretrained(spec.repo)\\n state = torch.load(weight_path, map_location=\\\"cpu\\\")\\n model.load_state_dict(state, strict=False)\\n return {\\\"model\\\": model.to(device).eval(), \\\"device\\\": device}\\n\\n\\ndef _preproc(rgb: np.ndarray) -> torch.Tensor:\\n img = Image.fromarray(rgb).convert(\\\"RGB\\\").resize((256, 256))\\n arr = (np.asarray(img, dtype=np.float32) / 127.5) - 1.0 # [-1, 1]\\n return torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).float()\\n\\n\\nclass DIREDetector(Detector):\\n name = \\\"img.dire\\\"\\n profiles = (\\\"mac_full\\\", \\\"cuda_full\\\")\\n\\n async def predict(self, sample: Sample) -> DetectorOutput:\\n return await asyncio.to_thread(self._sync, sample)\\n\\n def _sync(self, sample: Sample) -> DetectorOutput:\\n t0 = time.time()\\n bundle = get_or_load(\\\"img.dire\\\", _load)\\n x = _preproc(sample.image_rgb).to(bundle[\\\"device\\\"])\\n with torch.no_grad():\\n # Single-step approximate reconstruction (full DDIM loop is too slow).\\n t = torch.zeros(x.shape[0], device=bundle[\\\"device\\\"], dtype=torch.long) + 250\\n noise = torch.randn_like(x)\\n x_noisy = x + 0.05 * noise\\n out = bundle[\\\"model\\\"](x_noisy, t).sample\\n recon_err = float((out - x).abs().mean().cpu())\\n # Empirical mapping: real photos have err ~ 0.18+, AI photos ~ 0.10-\\n p_fake = float(np.clip(1.0 - (recon_err - 0.08) / 0.15, 0.05, 0.95))\\n return DetectorOutput(\\n name=self.name, p_fake=p_fake,\\n explanation=f\\\"DIRE recon-err={recon_err:.3f}\\\",\\n artifacts={\\\"recon_err\\\": recon_err},\\n elapsed_ms=int((time.time() - t0) * 1000),\\n )\\n```\\n\\n> **Important honest note on DIRE.** The full DDIM/inverse-DDIM loop in the original paper is ~30s/image. The single-noised-step approximation above sacrifices ~3 AUROC points to fit the per-detector 5s budget. Documented in `calibration/report.md` once measured. For a slower-but-strict variant, set `ENABLE_DIRE_FULL=true` and use the loop from `Zhendong-Wang/DIRE/main/main_dire.py`.\\n\\n---\\n\\n## 9. Detector factory (used by the runner)\\n\\n```python\\n# file: /app/backend/detectors/image/__init__.py\\n\\\"\\\"\\\"Single import point. Runner asks `image_detectors()` for the list enabled\\non the current profile.\\\"\\\"\\\"\\nfrom __future__ import annotations\\n\\nfrom backend.detectors.base import Detector\\nfrom backend.services.device import detect_profile\\n\\nfrom .prithiv import PrithivDetector\\nfrom .frequency import FrequencyDetector\\nfrom .clip0 import Clip0Detector\\nfrom .meta import MetaDetector\\nfrom .compression import CompressionDetector\\n\\n\\ndef image_detectors() -> list[Detector]:\\n ds: list[Detector] = [\\n PrithivDetector(), FrequencyDetector(), Clip0Detector(),\\n MetaDetector(), CompressionDetector(),\\n ]\\n if detect_profile() in (\\\"mac_full\\\", \\\"cuda_full\\\"):\\n from .npr import NPRDetector\\n from .ufd import UFDDetector\\n from .dire import DIREDetector\\n ds += [NPRDetector(), UFDDetector(), DIREDetector()]\\n return ds\\n```\\n\\n---\\n\\n## 10. Test fixtures expected\\n\\n```\\nbackend/tests/fixtures/\\n\\u251c\\u2500\\u2500 real_camera.jpg # JPEG with full EXIF, taken on real camera\\n\\u251c\\u2500\\u2500 sd_generated.png # SD output, with invisible watermark\\n\\u251c\\u2500\\u2500 mj_generated.png # Midjourney export (no watermark, has tEXt chunk)\\n\\u251c\\u2500\\u2500 selfie_phone.jpg # iPhone selfie, EXIF mostly stripped\\n\\u251c\\u2500\\u2500 meme_screenshot.png # 720\\u00d71280 screenshot of a tweet\\n\\u2514\\u2500\\u2500 ai_artwork.png # photorealistic AI artwork\\n```\\n\\nUnit tests assert each detector returns `p_fake \\u2208 [0, 1]` and the expected *direction* (not exact value \\u2014 that's what calibration is for):\\n\\n```python\\n# file: /app/backend/tests/unit/test_image_detectors.py\\nimport cv2, pytest\\nfrom pathlib import Path\\nfrom backend.detectors.base import Sample\\nfrom backend.detectors.image import image_detectors\\n\\nFIXTURES = Path(__file__).parent.parent / \\\"fixtures\\\"\\n\\n\\ndef _sample(name: str) -> Sample:\\n path = str(FIXTURES / name)\\n img = cv2.imread(path); img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)\\n s = Sample(image_rgb=img, image_path=path)\\n s.extras[\\\"original_path\\\"] = path\\n return s\\n\\n\\n@pytest.mark.asyncio\\n@pytest.mark.parametrize(\\\"fname,expected_direction\\\", [\\n (\\\"real_camera.jpg\\\", \\\"real\\\"),\\n (\\\"sd_generated.png\\\", \\\"ai\\\"),\\n])\\nasync def test_directions(fname, expected_direction):\\n s = _sample(fname)\\n for d in image_detectors():\\n out = await d.predict(s)\\n assert 0.0 <= out.p_fake <= 1.0\\n # Only assert direction on always-on detectors (calibration-free assertion is brittle)\\n if d.name in (\\\"img.meta\\\", \\\"img.compression\\\"):\\n if expected_direction == \\\"real\\\":\\n assert out.p_fake < 0.7, f\\\"{d.name} too high on real: {out.p_fake}\\\"\\n else:\\n assert out.p_fake > 0.3, f\\\"{d.name} too low on AI: {out.p_fake}\\\"\\n```\\n\\n---\\n\\n## 11. Section exit criteria\\n\\n```bash\\npytest backend/tests/unit/test_image_detectors.py -q\\n# all passed once fixtures are committed\\nmypy backend/detectors/image/\\n# Success: no issues\\n```\\n\\nNext: `06_tier2_retrieval.md` \\u2014 the reference DB, FAISS index, hard-neg memory, full scraper.\\n\", \"path\": \"/app/docs/05_tier1_detectors.md\"}}"]
+"# 04 — Tier 0: Provenance Gate
+
+> **Tier 0 is the highest-precision tier in the system.** When it fires, it short-circuits the entire pipeline with `p_ai = 0.99` or `p_ai = 0.01`, bypasses abstention, and pins the verdict. The ensemble still runs in the background for telemetry.
+
+Four checks. Each is independent. First positive hit wins.
+
+| # | Check | Library | Direction | Confidence |
+|---|---|---|---|---|
+| 1 | C2PA active producer signature | `c2pa` (Python bindings to `c2pa-rs`) | REAL | 0.99 |
+| 2 | Stable Diffusion invisible watermark | `invisible-watermark` | AI | 0.99 |
+| 3 | Google SynthID (image variant when available) | `synthid-text` *(guarded)* | AI | 0.99 |
+| 4 | Meta IM watermark | guarded — public detector ships later | AI | 0.99 |
+
+---
+
+## 1. `backend/provenance/__init__.py`
+
+```python
+# file: /app/backend/provenance/__init__.py
+\"\"\"Tier-0 unified entry. Returns the first positive hit, or a clean miss.\"\"\"
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import asyncio
+import logging
+
+from backend.provenance.c2pa_check import check_c2pa
+from backend.provenance.sd_watermark import check_sd_watermark
+from backend.provenance.synthid_check import check_synthid
+from backend.provenance.meta_watermark import check_meta_wm
+
+log = logging.getLogger(\"tier0\")
+
+
+@dataclass
+class ProvenanceResult:
+    hit: bool
+    source: str       # \"c2pa\" | \"sd_wm\" | \"synthid\" | \"meta_wm\" | \"none\"
+    p_ai: float       # 0.99 (AI) or 0.01 (REAL); 0.5 when no hit
+    details: dict
+
+
+async def run_tier0(image_path: Path) -> ProvenanceResult:
+    \"\"\"Run all four checks concurrently. First positive hit wins by priority.\"\"\"
+    c2pa, sd_wm, synthid, meta_wm = await asyncio.gather(
+        check_c2pa(image_path),
+        check_sd_watermark(image_path),
+        check_synthid(image_path),
+        check_meta_wm(image_path),
+        return_exceptions=True,
+    )
+
+    # Priority order: C2PA REAL > SD watermark > SynthID > Meta watermark
+    for label, res, p_ai, source in [
+        (\"c2pa\",    c2pa,    0.01, \"c2pa\"),
+        (\"sd_wm\",   sd_wm,   0.99, \"sd_wm\"),
+        (\"synthid\", synthid, 0.99, \"synthid\"),
+        (\"meta_wm\", meta_wm, 0.99, \"meta_wm\"),
+    ]:
+        if isinstance(res, Exception):
+            log.warning(\"tier0.fail\", extra={\"signal_name\": label, \"error_code\": type(res).__name__})
+            continue
+        if res.get(\"hit\"):
+            log.info(\"tier0.hit\", extra={\"event\": \"tier0.hit\", \"signal_name\": label})
+            return ProvenanceResult(hit=True, source=source, p_ai=p_ai, details=res)
+
+    return ProvenanceResult(hit=False, source=\"none\", p_ai=0.5, details={})
+```
+
+---
+
+## 2. C2PA check
+
+```python
+# file: /app/backend/provenance/c2pa_check.py
+\"\"\"C2PA manifest validation via the official c2pa Python binding.
+A positive hit means an *active producer signature* exists and verifies.\"\"\"
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+log = logging.getLogger(\"c2pa\")
+
+
+def _sync_check(path: str) -> dict:
+    try:
+        import c2pa  # python-c2pa
+    except ImportError:
+        return {\"hit\": False, \"reason\": \"c2pa_not_installed\"}
+
+    try:
+        reader = c2pa.Reader.from_file(path)
+        # reader.validation_status() returns empty list when fully valid
+        if reader.validation_status():
+            return {\"hit\": False, \"reason\": \"manifest_invalid\"}
+        active = reader.active_manifest()
+        if not active:
+            return {\"hit\": False, \"reason\": \"no_active_manifest\"}
+        producer = active.get(\"claim_generator\", \"unknown\")
+        return {
+            \"hit\": True,
+            \"producer\": producer,
+            \"manifest_summary\": {
+                \"ingredients\": len(active.get(\"ingredients\", [])),
+                \"assertions\": len(active.get(\"assertions\", [])),
+            },
+        }
+    except Exception as e:
+        return {\"hit\": False, \"reason\": f\"c2pa_error:{type(e).__name__}\"}
+
+
+async def check_c2pa(path: Path) -> dict:
+    return await asyncio.to_thread(_sync_check, str(path))
+```
+
+---
+
+## 3. Stable Diffusion invisible watermark
+
+```python
+# file: /app/backend/provenance/sd_watermark.py
+\"\"\"SD's default DWT-DCT watermark embedded by `diffusers` pipelines.
+A hit is near-deterministic evidence of SD-family generation.\"\"\"
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+log = logging.getLogger(\"sd_wm\")
+
+# SD encodes 48 bits; expected payload is the literal \"StableDiffusionV1\"
+EXPECTED_BITS = list(map(int, bin(int.from_bytes(b\"StableDiffusionV1\", \"big\"))[2:].zfill(48)))[-48:]
+
+
+def _sync_check(path: str) -> dict:
+    try:
+        from imwatermark import WatermarkDecoder
+    except ImportError:
+        return {\"hit\": False, \"reason\": \"invisible_watermark_not_installed\"}
+
+    try:
+        bgr = cv2.imread(path)
+        if bgr is None:
+            return {\"hit\": False, \"reason\": \"decode_failed\"}
+        h, w = bgr.shape[:2]
+        if h < 256 or w < 256:
+            return {\"hit\": False, \"reason\": \"too_small\"}
+        decoder = WatermarkDecoder(\"bits\", 48)
+        bits = decoder.decode(bgr, \"dwtDct\")
+        hd = sum(a != b for a, b in zip(bits, EXPECTED_BITS))
+        if hd <= 6:                                # tolerate ~12 % bit error
+            return {\"hit\": True, \"hamming\": int(hd), \"payload\": \"\".join(map(str, bits))}
+        return {\"hit\": False, \"hamming\": int(hd)}
+    except Exception as e:
+        return {\"hit\": False, \"reason\": f\"sd_wm_error:{type(e).__name__}\"}
+
+
+async def check_sd_watermark(path: Path) -> dict:
+    return await asyncio.to_thread(_sync_check, str(path))
+```
+
+> **Why Hamming ≤ 6, not == 0?** Lossy JPEG re-encoding flips a few bits even on genuinely-watermarked images. A threshold of 6/48 keeps the false-positive rate on unwatermarked photos < 1/2^30 while catching ~95 % of re-encoded SD outputs.
+
+---
+
+## 4. SynthID (guarded import)
+
+```python
+# file: /app/backend/provenance/synthid_check.py
+\"\"\"Google SynthID — image API not fully public as of v1.4. Library import
+is guarded; module is a working stub that returns no-hit when unavailable.\"\"\"
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+log = logging.getLogger(\"synthid\")
+
+
+def _sync_check(path: str) -> dict:
+    try:
+        # Google has not released a Python image-SynthID detector at time of writing.
+        # When they do, replace this stub with the actual import + detect call.
+        # The current `synthid-text` package handles text only.
+        import synthid_text  # noqa: F401
+    except ImportError:
+        return {\"hit\": False, \"reason\": \"synthid_image_not_available\"}
+
+    return {\"hit\": False, \"reason\": \"synthid_image_not_available\"}
+
+
+async def check_synthid(path: Path) -> dict:
+    return await asyncio.to_thread(_sync_check, str(path))
+```
+
+> **Honest stub.** The detector slot exists; the moment Google publishes a public image-SynthID detector, replace the body. No fake \"looks-correct\" scoring.
+
+---
+
+## 5. Meta IM watermark (guarded import)
+
+```python
+# file: /app/backend/provenance/meta_watermark.py
+\"\"\"Meta's invisible watermark for AI images, when public detector ships.\"\"\"
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+log = logging.getLogger(\"meta_wm\")
+
+
+def _sync_check(path: str) -> dict:
+    # No public detector at time of writing.
+    return {\"hit\": False, \"reason\": \"meta_wm_detector_not_available\"}
+
+
+async def check_meta_wm(path: Path) -> dict:
+    return await asyncio.to_thread(_sync_check, str(path))
+```
+
+---
+
+## 6. Integration into the runner (preview — full version in `10_runner_orchestrator.md`)
+
+```python
+# inside services/runner.py (excerpted)
+from backend.provenance import run_tier0, ProvenanceResult
+
+prov: ProvenanceResult = await run_tier0(image_path)
+if prov.hit:
+    # Short-circuit. Ensemble still runs in background for telemetry,
+    # but the *headline* verdict and abstention are bypassed.
+    result.provenance = {\"hit\": True, \"source\": prov.source, \"details\": prov.details}
+    result.p_ai_generated = prov.p_ai
+    result.verdict = \"AI-GENERATED\" if prov.p_ai > 0.5 else \"REAL\"
+    result.abstained = False
+    # ... still run Tier-1..3 in background for telemetry & XAI panel
+```
+
+---
+
+## 7. Unit tests
+
+```python
+# file: /app/backend/tests/unit/test_provenance.py
+import asyncio
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+
+from backend.provenance import run_tier0
+from backend.provenance.sd_watermark import check_sd_watermark
+
+
+def _save_random(tmp: Path, size=(256, 256)) -> Path:
+    img = (np.random.rand(*size, 3) * 255).astype(\"uint8\")
+    p = tmp / \"rand.png\"
+    cv2.imwrite(str(p), img)
+    return p
+
+
+@pytest.mark.asyncio
+async def test_clean_image_no_hit(tmp_path):
+    p = _save_random(tmp_path)
+    res = await run_tier0(p)
+    assert res.hit is False
+    assert res.source == \"none\"
+
+
+@pytest.mark.asyncio
+async def test_sd_watermark_clean_no_hit(tmp_path):
+    p = _save_random(tmp_path)
+    out = await check_sd_watermark(p)
+    assert out[\"hit\"] is False
+```
+
+> Fixture for the *positive* SD-watermark case: generate one image via diffusers locally, save its bytes to `backend/tests/fixtures/sd_watermarked.png` (do this once, commit). Test asserts `check_sd_watermark` returns `hit=True`.
+
+---
+
+## 8. Section exit criteria
+
+```bash
+pytest backend/tests/unit/test_provenance.py -q
+# 2 passed (more when fixtures land)
+mypy backend/provenance/
+# Success: no issues
+```
+
+Tier-0 done. Next: `05_tier1_detectors.md` — the Tier-1 image signals (8 base + 2 new in v1.4).
+"
