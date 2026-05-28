@@ -46,10 +46,15 @@ class FusionResult:
 
 @dataclass
 class Verdict:
-    label: Literal[\"AI-GENERATED\", \"REAL\", \"INCONCLUSIVE\"]
+    label: Literal[\"AI-GENERATED\", \"REAL\", \"INCONCLUSIVE\", \"MANIPULATED\"]
     confidence: float                  # 0..1
     abstained: bool
     rationale: str                     # 1-line reason
+
+    # NOTE: \"MANIPULATED\" is set ONLY by the runner cross-check in
+    # 10_runner_orchestrator.md §2 (`_manipulation_check`) — never by an
+    # individual detector. It means EXIF-camera-shape contradicts both
+    # frequency-domain and compression fingerprints.
 ```
 
 ---

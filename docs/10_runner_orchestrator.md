@@ -54,30 +54,26 @@
 
 ---
 
-## 1. Schema patch — add `MANIPULATED` verdict class
+## 1. Schema state (already consolidated — no patch needed)
 
-**Before writing the runner**, update `02_backend_skeleton.md §7` Pydantic schemas
-to include the fourth class:
+`MANIPULATED` is **already** declared as the fourth verdict class in:
 
-```python
-# file: /app/backend/schemas/results.py (DELTA — replace the Verdict literal)
-Verdict = Literal[\"AI-GENERATED\", \"REAL\", \"INCONCLUSIVE\", \"MANIPULATED\"]
-```
+- `02_backend_skeleton.md §7` — `Result.verdict` literal includes `\"MANIPULATED\"`
+  and adds the `third_party: list[dict[str, Any]]` field that this runner
+  emits at stage 7.
+- `08_fusion_calibration_abstention.md §1` — `fusion/types.py::Verdict.label`
+  literal includes `\"MANIPULATED\"`.
 
-And in `08_fusion_calibration_abstention.md §1`:
+This runner is the **only** place that may emit the `MANIPULATED` label — it is
+set by `_manipulation_check()` in §2 below when EXIF metadata claims a real
+camera but frequency-domain + compression fingerprints both match a diffusion
+signature. No individual detector is allowed to set it.
 
-```python
-# file: /app/backend/fusion/types.py (DELTA on Verdict dataclass field)
-@dataclass
-class Verdict:
-    label: Literal[\"AI-GENERATED\", \"REAL\", \"INCONCLUSIVE\", \"MANIPULATED\"]
-    confidence: float
-    abstained: bool
-    rationale: str
-```
-
-The MANIPULATED verdict is set by a runner-stage cross-check (this file §3.10),
-not by any single detector. Reasoning is in `05c_v15_addendum.md §6` (trick G).
+Reasoning recap: real cameras leave correlated artefacts (genuine sensor noise,
+single-quantisation JPEG ghost, no FFT periodic peaks); diffusion models leave
+the opposite pattern. EXIF can be spoofed cheaply; FFT + DCT cannot. When the
+two conflict, the upload was almost certainly **manipulated** (real photo
+edited by AI, or AI image with EXIF injected) and deserves its own label.
 
 ---
 

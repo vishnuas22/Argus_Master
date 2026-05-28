@@ -27,6 +27,14 @@
 | 12 | `12_scripts_and_testing.md` | `build_reference_db`, `run_calibration`, `tune_thresholds`, pytest, testing_agent_v3 plan |
 | 13 | `13_milestones_and_dod.md` | M0→M3 step-by-step with checkpoints + Definition of Done |
 
+
+ **Implementer note (2026-02 patch):** the cross-document schema deltas that
+> previously lived in `10_runner_orchestrator.md §1` have been **consolidated
+> into `02_backend_skeleton.md §7` and `08_fusion_calibration_abstention.md §1`**.
+> You can now implement each file top-to-bottom in the order below without
+> holding deltas in memory. The `MANIPULATED` verdict, the `third_party` field,
+> and the `Verdict.label` literal are already final in those two files.
+
 ---
 
 ## 1. What v1.4 adds on top of v1.3.1

@@ -552,7 +552,7 @@ class Result(BaseModel):
     calibration: Literal[\"platt_refdb\", \"platt_blended\", \"isotonic\"]
     fusion_model: Literal[\"uniform\", \"lr_l2\", \"gbdt\"]
     content_type: str
-    verdict: Literal[\"AI-GENERATED\", \"REAL\", \"INCONCLUSIVE\"]
+    verdict: Literal[\"AI-GENERATED\", \"REAL\", \"INCONCLUSIVE\", \"MANIPULATED\"]
     p_ai_generated: float
     confidence: float
     agreement: float
@@ -565,10 +565,18 @@ class Result(BaseModel):
     signals: list[SignalOut]
     retrieval: dict[str, Any]
     reverse_search: dict[str, Any]
+    third_party: list[dict[str, Any]] = Field(default_factory=list)
     xai: XAI
     input: dict[str, Any]
     durations_ms: dict[str, int]
     debug: dict[str, Any] | None = None
+
+      # NOTE: `MANIPULATED` is set by the runner cross-check
+    # (see 10_runner_orchestrator.md §2, `_manipulation_check`) when EXIF claims
+    # a real camera but frequency + compression signatures both match a diffusion
+    # signature. `third_party` carries Tier-1.5 provider results (Hive /
+    # SightEngine / AI-or-Not). Both fields are emitted by the runner —
+    # do not remove.
 ```
 
 ---
