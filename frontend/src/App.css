@@ -1,0 +1,6 @@
+/* ARGUS — component-level tweaks (layout lives in Tailwind classes) */
+
+input[type="range"] {
+    accent-color: #10b981;
+  }
+  
